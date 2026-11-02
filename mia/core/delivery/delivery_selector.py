@@ -26,6 +26,7 @@ WRITE_MODE_ENV = "MIA_APERTURE_WRITE_MODE"
 
 # A literal, not an import: mia.core._plugin is mid-import when apply() runs.
 HS_WORKER = "hidden_states"
+HS_WORKERS = (HS_WORKER, "steer_capture")
 
 DEFAULT_FLUSH_MS = 200
 
@@ -205,17 +206,27 @@ def resolve(env: Mapping[str, str], *, worker_kind: Optional[str] = None,
             raise DeliveryConfigError(
                 f"{MODE_ENV}=hybrid needs CUDA graph mode and this engine runs eager; unset "
                 f"{MODE_ENV}, or drop enforce_eager=True (vllm serve: --enforce-eager).")
-        if kind != HS_WORKER:
+        if kind not in HS_WORKERS:
             raise DeliveryConfigError(
                 f"{MODE_ENV}=hybrid applies to hidden-states capture only, not the {kind!r} "
                 f"worker; unset {MODE_ENV}.")
         return _hybrid(env, "explicit", f"{MODE_ENV}=hybrid")
     if mode_env == "drain":
+        if kind == "hidden_state_accum":
+            raise DeliveryConfigError(
+                "MIA_APERTURE_DELIVERY=drain is not supported for hidden_state_accum; "
+                "accumulator result delivery has not been wired yet. Unset the override."
+            )
         return _drain("explicit", f"{MODE_ENV}=drain")
     if mode_env == "off":
         return _off(f"{MODE_ENV}=off: the shared files only", "explicit")
 
     if deliver_on or gather_on:
+        if kind == "hidden_state_accum":
+            return _off(
+                "the hidden_state_accum worker does not use hidden-state aperture delivery",
+                "scope",
+            )
         return Selection(
             mode="hybrid" if deliver_on else "off", source="explicit",
             reason=f"{DELIVER_ENV}/{GATHER_ENV} set by hand",
@@ -230,7 +241,12 @@ def resolve(env: Mapping[str, str], *, worker_kind: Optional[str] = None,
         return _off(f"{PER_REQUEST_ENV}=1 on an eager engine, which is inert -- the capture "
                     f"aperture only exists under graph mode")
 
-    if kind != HS_WORKER:
+    if kind not in HS_WORKERS:
+        if kind == "hidden_state_accum":
+            return _off(
+                "the hidden_state_accum worker has no per-request result delivery yet",
+                "scope",
+            )
         return _drain("scope",
                       f"the hybrid gather reads hs_layer_*.raw and is HIDDEN-STATES ONLY; this run "
                       f"is {WORKER_ENV}={kind}, whose per-request delivery is the drain's",
@@ -259,7 +275,7 @@ def _dp_size(env: Mapping[str, str]) -> int:
 def _no_ask_default(env: Mapping[str, str], kind: str, graph: bool) -> Selection:
     if not graph:
         return _off("eager -- no aperture", "scope")
-    if kind not in (HS_WORKER, "qk"):
+    if kind not in (*HS_WORKERS, "qk"):
         return _off(f"the {kind!r} worker has no capture artifact", "scope")
     if _is_on(env, PROFILE_ENV):
         return _off(f"{PROFILE_ENV}=1 measures capture only", "scope")

@@ -116,7 +116,7 @@ def _wrap_layer_class(cls: type) -> None:
     cls.forward = make_wrapped(orig_forward)
 
 
-def install_hs_hosts(worker) -> Optional[HostRegistry]:
+def install_hs_hosts(worker, *, layer_wrapper=None) -> Optional[HostRegistry]:
     """Install the CUDA-graph HS capture path via decoder-layer wrap."""
     _require_buffer_mode_hs()
 
@@ -184,7 +184,8 @@ def install_hs_hosts(worker) -> Optional[HostRegistry]:
 
     registry = _install_hs_buffer(
         worker, model, matched, num_layers, hidden_size,
-        should_capture, device_t, bake_op, owned_rows=owned_rows, symmetric=symmetric)
+        should_capture, device_t, bake_op, owned_rows=owned_rows, symmetric=symmetric,
+        layer_wrapper=layer_wrapper)
     set_registry(worker, "hs", registry)
     return registry
 
@@ -216,7 +217,7 @@ def _resolve_aperture_rows(worker, num_layers, hidden_size, buf_dtype, device,
 
 def _install_hs_buffer(worker, model, matched, num_layers, hidden_size,
                        should_capture, device, bake_op=None, owned_rows=None,
-                       symmetric=None) -> Optional[HostRegistry]:
+                       symmetric=None, *, layer_wrapper=None) -> Optional[HostRegistry]:
     if bake_op is None:
         bake_op = should_capture
     if symmetric is None:
@@ -231,9 +232,9 @@ def _install_hs_buffer(worker, model, matched, num_layers, hidden_size,
     if not should_capture or not owned:
         if bake_op:
             return _install_hs_sink(worker, matched, num_layers, hidden_size, cap, buf_dtype,
-                                    device)
+                                    device, layer_wrapper=layer_wrapper)
         for _name, module, _ln in matched:
-            _wrap_layer_class(type(module))
+            (layer_wrapper or _wrap_layer_class)(type(module))
         worker._capture_aperture = None
         return None
 
@@ -299,7 +300,7 @@ def _install_hs_buffer(worker, model, matched, num_layers, hidden_size,
             _attach_sink_host(module, name, layer_num0, cap, hidden_size, buf_dtype, device,
                               sink_index, sink_active)
             n_sinks += 1
-        _wrap_layer_class(type(module))
+        (layer_wrapper or _wrap_layer_class)(type(module))
 
     if registry is not None:
         registry.assign_views()
@@ -338,7 +339,8 @@ def _attach_sink_host(module, name, layer_num0, cap, hidden_size, buf_dtype, dev
     setattr(module, _HS_HOST_ATTR, host)
 
 
-def _install_hs_sink(worker, matched, num_layers, hidden_size, cap, buf_dtype, device) -> None:
+def _install_hs_sink(worker, matched, num_layers, hidden_size, cap, buf_dtype, device,
+                     *, layer_wrapper=None) -> None:
     sink_index = torch.zeros(num_layers, cap, dtype=torch.int64, device=device)
     sink_active = torch.zeros(num_layers, dtype=torch.int32, device=device)
     worker._hs_sink_index = sink_index
@@ -350,7 +352,7 @@ def _install_hs_sink(worker, matched, num_layers, hidden_size, cap, buf_dtype, d
             _attach_sink_host(module, name, layer_num0, cap, hidden_size, buf_dtype, device,
                               sink_index, sink_active)
             n_hosts += 1
-        _wrap_layer_class(type(module))
+        (layer_wrapper or _wrap_layer_class)(type(module))
     sink_bytes = (sink_index.numel() * sink_index.element_size()
                   + n_hosts * hidden_size * torch.empty(0, dtype=buf_dtype).element_size())
     print(f"[graph/install_hs] TP-symmetric SINK on tp_rank {getattr(worker, '_tp_rank', '?')}: "

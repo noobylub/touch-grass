@@ -4,7 +4,9 @@ from mia.llm import MiaLLM
 from mia.client import MiaClient
 from mia.workers.qk_capture_worker import QKCaptureWorker
 from mia.workers.steer_worker import SteerWorker
+from mia.workers.steer_capture_worker import SteerCaptureWorker
 from mia.workers.hs_capture_worker import HSCaptureWorker
+from mia.workers.hidden_state_accum_worker import HiddenStateAccumWorker
 from mia.analyzers.attention_tracker_analyzer import AttntrackerAnalyzer
 from mia.analyzers.core_reranker_analyzer import CorerAnalyzer
 from mia.analyzers.hidden_states_analyzer import HiddenStatesAnalyzer
@@ -17,7 +19,9 @@ def register_plugins():
     """Register MIA's workers and analyzers in ``PluginRegistry`` (vLLM plugin entry point)."""
     PluginRegistry.register_worker("capture_qk",       QKCaptureWorker)
     PluginRegistry.register_worker("steer",      SteerWorker)
+    PluginRegistry.register_worker("steer_capture", SteerCaptureWorker)
     PluginRegistry.register_worker("capture_hs", HSCaptureWorker)
+    PluginRegistry.register_worker("hidden_state_accum", HiddenStateAccumWorker)
 
     PluginRegistry.register_analyzer("attnlink",              AttnLinkAnalyzer)
     PluginRegistry.register_analyzer("attn_tracker",          AttntrackerAnalyzer)
@@ -32,7 +36,9 @@ __all__ = [
     "MiaClient",
     "QKCaptureWorker",
     "SteerWorker",
+    "SteerCaptureWorker",
     "HSCaptureWorker",
+    "HiddenStateAccumWorker",
     "AttntrackerAnalyzer",
     "AttnLinkAnalyzer",
     "CorerAnalyzer",

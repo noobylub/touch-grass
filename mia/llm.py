@@ -79,7 +79,8 @@ class MiaLLM:
 
         Args:
             model: model name or path, as for ``vllm.LLM``.
-            worker_name: "capture_hs", "capture_qk" or "steer"; None runs no MIA worker.
+            worker_name: "capture_hs", "capture_qk", "steer" or "steer_capture";
+                None runs no MIA worker.
             analyzer_name: a registered analyzer for ``analyze()``; None for none.
             config_file: JSON with the worker's settings (heads, Q/K mode, steering, HS layers).
             download_dir: model download dir; also the root of the default ``hook_dir``.
@@ -202,7 +203,7 @@ class MiaLLM:
                             request_extra_args: Optional[dict] = None) -> dict:
         extra = {}
         request_extra_args = request_extra_args or {}
-        if self.worker_name == "capture_hs":
+        if self.worker_name in ("capture_hs", "steer_capture"):
             extra["output_hidden_states"] = self._output_layers if self._output_layers else True
             extra["hs_mode"] = self._hs_mode
         elif self.worker_name == "capture_qk":
@@ -212,7 +213,7 @@ class MiaLLM:
             if cap == "score":
                 extra["qk_capture"] = "score"
                 extra["score_head"] = self._score_head
-        elif self.worker_name == "steer":
+        if self.worker_name in ("steer", "steer_capture"):
             base = dict(self._steering_config) if self._steering_config else {}
             override = request_extra_args.get("steer")
             if isinstance(override, dict):

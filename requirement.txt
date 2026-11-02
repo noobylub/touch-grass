@@ -1,4 +1,6 @@
 numpy==2.3.5
+openai
+python-dotenv
 safetensors==0.8.0
 torch==2.13.0
 transformers==5.17.0

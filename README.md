@@ -162,6 +162,15 @@ if __name__ == "__main__":
     llm.llm_engine.engine_core.shutdown()
 ```
 
+  ### Hidden-state accumulation routing
+
+  With the `hidden_state_accum` worker, `_route_tokens` runs before the decoder forward and fills a
+  `[layer, scheduled-token-row]` map with each selected request's GPU accumulator slot (`-1` means
+  skip). Each wrapped decoder layer passes its own map row to the CUDA accumulation op, which adds
+  that layer's selected token vectors into the request's GPU sum and count. This routing connects the
+  pre-forward request metadata to the in-forward hidden states; it does not combine different
+  requests into groups.
+
 **Steer, offline:**
 
 ```python

@@ -137,13 +137,19 @@ _original_chat_full_generator: Callable | None = None
 _ADDED_IDS: contextvars.ContextVar = contextvars.ContextVar("mia_added_ids", default=None)
 
 _WORKER_EXT_HS = "mia.workers.hs_capture_worker.HSCaptureWorker"
+_WORKER_EXT_HIDDEN_ACCUM = (
+    "mia.workers.hidden_state_accum_worker.HiddenStateAccumWorker"
+)
 _WORKER_EXT_QK = "mia.workers.qk_capture_worker.QKCaptureWorker"
 _WORKER_EXT_STEER = "mia.workers.steer_worker.SteerWorker"
+_WORKER_EXT_STEER_CAPTURE = "mia.workers.steer_capture_worker.SteerCaptureWorker"
 
 _WORKER_EXT_BY_KIND = {
     "hidden_states": _WORKER_EXT_HS,
+    "hidden_state_accum": _WORKER_EXT_HIDDEN_ACCUM,
     "qk": _WORKER_EXT_QK,
     "steer": _WORKER_EXT_STEER,
+    "steer_capture": _WORKER_EXT_STEER_CAPTURE,
 }
 
 
@@ -184,9 +190,17 @@ def _aperture_per_request_mode(engine=None) -> bool:
     return os.environ.get("MIA_APERTURE_PER_REQUEST") == "1" and graph
 
 
+def _steering_only_for_delivery(wants_hs: bool, wants_qk: bool, wants_steer: bool,
+                                engine=None) -> bool:
+    return wants_steer and not (
+        wants_hs and not wants_qk and _engine_worker_kind(engine) == "steer_capture")
+
+
 def _aperture_per_request_kind(extra: dict, wants_hs: bool, wants_qk: bool,
                                wants_steer: bool, engine=None):
-    if not (_aperture_per_request_mode(engine) and not _profile_mode()) or wants_steer:
+    if not (_aperture_per_request_mode(engine) and not _profile_mode()):
+        return None
+    if _steering_only_for_delivery(wants_hs, wants_qk, wants_steer, engine):
         return None
     if _resolve_sink(extra) == "drop":
         return None
@@ -207,7 +221,8 @@ def _hybrid_serves(extra: dict, wants_hs: bool, wants_qk: bool, wants_steer: boo
     stamp = os.environ.get(STAMP_ENV) or ""
     graph = _engine_graph(engine) if engine is not None else _graph_mode()
     return (stamp.partition(":")[0] == "hybrid" and graph
-            and wants_hs and not wants_qk and not wants_steer
+            and wants_hs and not wants_qk
+            and not _steering_only_for_delivery(wants_hs, wants_qk, wants_steer, engine)
             and _resolve_sink(extra) != "drop" and not _profile_mode())
 
 
@@ -795,7 +810,10 @@ _WORKER_KIND_TO_SUBSYSTEM = {"hidden_states": "hs", "qk": "qk", "steer": "steer"
 
 def _enabled_subsystems(worker_kinds) -> set:
     kinds = [worker_kinds] if isinstance(worker_kinds, str) else list(worker_kinds or ())
-    return {_WORKER_KIND_TO_SUBSYSTEM[k] for k in kinds if k in _WORKER_KIND_TO_SUBSYSTEM}
+    subsystems = {_WORKER_KIND_TO_SUBSYSTEM[k] for k in kinds if k in _WORKER_KIND_TO_SUBSYSTEM}
+    if "steer_capture" in kinds:
+        subsystems.update(("hs", "steer"))
+    return subsystems
 
 
 def _model_dims(config) -> dict:
@@ -943,7 +961,7 @@ def mia_graph_layout(engine_args, worker_kind: str) -> dict:
             aperture = raw_aperture.strip()
     layout: dict = {"kind": kind, "tp_size": tp_size, "aperture_gpu_bytes": aperture}
 
-    if kind == "hidden_states":
+    if kind in ("hidden_states", "steer_capture"):
         mode = resolve_hs_shard_mode(tp_size)
         owned = {
             HS_MODE_ROUND_ROBIN: f"layers i where i % {tp_size} == tp_rank",
@@ -964,7 +982,7 @@ def mia_graph_layout(engine_args, worker_kind: str) -> dict:
             "qk_capture_mode": (os.environ.get("MIA_QK_CAPTURE", "buffer") or "").strip().lower(),
             "qk_head_shard": f"1/{tp_size} of the q and kv heads on every rank",
         })
-    elif kind == "steer":
+    if kind in ("steer", "steer_capture"):
         raw_vmax = os.environ.get("MIA_STEER_VMAX", "16") or "16"
         try:
             v_max: object = int(raw_vmax)
@@ -1780,6 +1798,16 @@ def _check_steer_vmax(engine, path, pending=()) -> None:
 
 async def _refuse_on_graph_serve(engine, extra):
     info = None
+    steer = extra.get("steer") if isinstance(extra, dict) else None
+    if isinstance(steer, dict) and "vector" in steer:
+        if _engine_worker_kind(engine) != "steer_capture":
+            raise MiaConfigurationError("steer.vector is supported only by steer_capture")
+        from mia.workers.steer_capture_inline import resolve_inline_steering
+
+        try:
+            extra["steer"] = resolve_inline_steering(engine, steer, lambda *_: None)
+        except (ValueError, TypeError, OverflowError, RuntimeError) as exc:
+            raise MiaConfigurationError(f"invalid inline steering vector: {exc}") from exc
     if isinstance(extra, dict) and extra.get("steer") and _engine_graph(engine):
         target = _steer_target(engine, extra.get("steer"))
         if target is not None and target[0] not in _engine_attr_dict(engine,
@@ -1848,11 +1876,17 @@ async def _patched_generate(
     wants_hs = extra.get("output_hidden_states") is not None
     wants_qk = extra.get("output_qk") is not None
     wants_steer = isinstance(extra.get("steer"), dict)
+    steering_only = _steering_only_for_delivery(wants_hs, wants_qk, wants_steer, self)
     needs_hooks = wants_hs or wants_qk or wants_steer
     save_to_disk = bool(extra.get("save_to_disk"))
     _explicit_std = bool(extra["save_to_disk"]) if "save_to_disk" in extra else None
     _refuse_unsupported_tp_request(self, extra)
     _steer_new = await _refuse_on_graph_serve(self, extra)
+    _steer_fifo_path = None
+    if (_engine_worker_kind(self) == "steer_capture" and wants_steer
+            and isinstance(extra["steer"].get("vector_path"), str)):
+        _steer_fifo_path = extra["steer"]["vector_path"]
+        _steer_new = None
     _qk_keys = _sample_keys(str(request_id), int(getattr(effective_params, "n", 1) or 1))
 
     if "save_to_disk" not in extra:
@@ -1926,13 +1960,17 @@ async def _patched_generate(
     _cached_counts: dict = {}
     _delta = getattr(getattr(effective_params, "output_kind", None), "name", "") == "DELTA"
     _hook_gen_toks = 0
-    _prof_capture = needs_hooks and not wants_steer and _profile_mode()
+    _prof_capture = needs_hooks and not steering_only and _profile_mode()
     _steer_new = _hold_steer(self, _steer_new)
     _added: list = []
     _ADDED_IDS.set(_added)
     _nonce, _start = uuid.uuid4().hex, time.time_ns()
     _writer_ends_turn = False
     try:
+        if _steer_fifo_path is not None:
+            from mia.workers.steer_capture_inline import pin_steering_vector
+
+            await pin_steering_vector(self, _steer_fifo_path)
         async for output in _original_generate(
             self, prompt, sampling_params, request_id, **kwargs
         ):
@@ -1949,14 +1987,14 @@ async def _patched_generate(
             if _prof_capture:
                 for _o in (getattr(output, "outputs", None) or []):
                     _hook_gen_toks += len(getattr(_o, "token_ids", None) or [])
-            if output.finished and needs_hooks and not wants_steer and _profile_mode():
+            if output.finished and wants_steer:
+                PROF.incr("steer.fire")
+            if output.finished and needs_hooks and not steering_only and _profile_mode():
                 PROF.incr("request_done")
                 PROF.event("request_done",
                            {"req_id": str(request_id), "boundary": "data_prepared"})
                 _emit_capture_evidence(self, output, extra, wants_hs, wants_qk, _hook_gen_toks)
-            elif output.finished and wants_steer:
-                PROF.incr("steer.fire")
-            elif output.finished and needs_hooks and not wants_steer:
+            elif output.finished and needs_hooks and not steering_only:
                 sink = _resolve_sink(extra)
                 if sink == "drop":
                     pass
@@ -2038,7 +2076,11 @@ async def _patched_generate(
         if needs_hooks and not _writer_ends_turn:
             _end_completion_turn(extra, request_id)    # frees the next prompt's run write
         _release_steer(self, _steer_new, admitted=False)
-        if needs_hooks and not wants_steer and not _hybrid:
+        if _steer_fifo_path is not None:
+            from mia.workers.steer_capture_inline import unpin_steering_vector
+
+            await unpin_steering_vector(self, _steer_fifo_path)
+        if needs_hooks and not steering_only and not _hybrid:
             await self.collective_rpc("clear_captured_states", args=(request_id,))
             if _aperture_per_request_mode(self) and ((wants_hs and not wants_qk)
                                              or (wants_qk and not wants_hs)):
@@ -2114,15 +2156,18 @@ def _offline_delivery_info(llm) -> dict:
         return info
     eng = getattr(llm, "llm_engine", None)
     info = {}
-    if eng is not None and _engine_worker_kind(eng) == "hidden_states":
+    if eng is not None and _engine_worker_kind(eng) in ("hidden_states", "steer_capture"):
         info = merge_info(llm.collective_rpc("mia_delivery_info"))
     llm._mia_delivery_info = info
     return info
 
 
-def _offline_hybrid_request(extra: dict) -> bool:
+def _offline_hybrid_request(extra: dict, engine=None) -> bool:
     wants_hs = extra.get("output_hidden_states") is not None
-    return (wants_hs and extra.get("output_qk") is None and not extra.get("steer")
+    wants_qk = extra.get("output_qk") is not None
+    wants_steer = bool(extra.get("steer"))
+    return (wants_hs and not wants_qk
+            and not _steering_only_for_delivery(wants_hs, wants_qk, wants_steer, engine)
             and _resolve_sink(extra) != "drop" and not _profile_mode())
 
 
@@ -2140,7 +2185,7 @@ def _deliver_offline(llm, outputs, engine_ids: dict) -> set:
             continue
         internal, params = rec
         extra = getattr(params, "extra_args", None) or {}
-        if _offline_hybrid_request(extra):
+        if _offline_hybrid_request(extra, getattr(llm, "llm_engine", None)):
             reqs.append((out, internal, extra))
     if not reqs:
         return set()
@@ -2691,9 +2736,15 @@ def register() -> None:
 
     try:
         patch_app_builder()
+        # Keep accumulator delivery on the existing MIA plugin lifecycle while
+        # its route implementation remains isolated in its own module.
+        from mia.core.delivery.hidden_state_accum_delivery import (
+            register as register_accum_delivery,
+        )
+        register_accum_delivery()
     except Exception as e:  # noqa: BLE001
-        print(f"[mia] delivered-data read route unavailable ({e!r}); MiaClient cannot read "
-              f"hybrid captures from this server.", flush=True)
+        print(f"[mia] delivery read route unavailable ({e!r}); remote capture reads "
+              "are unavailable on this server.", flush=True)
 
     _original_llm_generate = LLM.generate
     LLM.generate = _patched_llm_generate

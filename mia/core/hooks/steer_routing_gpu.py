@@ -29,6 +29,7 @@ if _HAVE_TRITON:
         cap,
         BLOCK: tl.constexpr,
         HAS_COL: tl.constexpr,
+        SLOT_PER_LAYER: tl.constexpr,
     ):
         L = tl.program_id(0)
         pid = tl.program_id(1)
@@ -41,9 +42,13 @@ if _HAVE_TRITON:
         if HAS_COL:
             sc = tl.load(scol_ptr + req, mask=cmask, other=-2)
             active = active & ((sc == -1) | (cols.to(tl.int64) == sc))
-        coeff = tl.load(scoeff_ptr + req, mask=cmask, other=0.0)
-        vid = tl.load(svid_ptr + req, mask=cmask, other=0)
-        mode = tl.load(smode_ptr + req, mask=cmask, other=0)
+        if SLOT_PER_LAYER:
+            slot = req * num_layers + L
+        else:
+            slot = req
+        coeff = tl.load(scoeff_ptr + slot, mask=cmask, other=0.0)
+        vid = tl.load(svid_ptr + slot, mask=cmask, other=0)
+        mode = tl.load(smode_ptr + slot, mask=cmask, other=0)
         base = L * cap + cols
         tl.store(coeff_ptr + base, tl.where(active, coeff, 0.0), mask=cmask)
         tl.store(vecid_ptr + base, tl.where(active, vid, 0), mask=cmask)
@@ -76,13 +81,19 @@ def _scatter_torch(qsl_dev, slot_vid, slot_mode, slot_coeff, slot_layer_mask,
     if slot_col is not None:
         sc = slot_col[req]
         valid = valid & ((sc == -1) | (col.to(sc.dtype) == sc))
-    vid_c = torch.where(valid, slot_vid[req], torch.zeros_like(req))
-    mode_c = torch.where(valid, slot_mode[req], torch.zeros_like(req))
-    coef_c = torch.where(valid, slot_coeff[req], torch.zeros(w, dtype=torch.float32, device=dev))
     mask = slot_layer_mask[req].transpose(0, 1) & valid.unsqueeze(0)
-    coeff_all[:, :w] = torch.where(mask, coef_c.unsqueeze(0).expand(num_layers, -1), 0.0)
-    vec_id_all[:, :w] = torch.where(mask, vid_c.unsqueeze(0).expand(num_layers, -1), 0)
-    mode_all[:, :w] = torch.where(mask, mode_c.unsqueeze(0).expand(num_layers, -1), 0)
+    # Rank-2 slots vary by layer; legacy rank-1 slots still broadcast across layers.
+    if slot_vid.ndim == 2:
+        vid = slot_vid[req].transpose(0, 1)
+        mode = slot_mode[req].transpose(0, 1)
+        coefficient = slot_coeff[req].transpose(0, 1)
+    else:
+        vid = slot_vid[req].unsqueeze(0).expand(num_layers, -1)
+        mode = slot_mode[req].unsqueeze(0).expand(num_layers, -1)
+        coefficient = slot_coeff[req].unsqueeze(0).expand(num_layers, -1)
+    coeff_all[:, :w] = torch.where(mask, coefficient, 0.0)
+    vec_id_all[:, :w] = torch.where(mask, vid, 0)
+    mode_all[:, :w] = torch.where(mask, mode, 0)
 
 
 def scatter_routing(qsl_dev, slot_vid, slot_mode, slot_coeff, slot_layer_mask,
@@ -110,7 +121,8 @@ def scatter_routing(qsl_dev, slot_vid, slot_mode, slot_coeff, slot_layer_mask,
         slot_col if slot_col is not None else slot_vid,
         coeff_all, vec_id_all, mode_all,
         int(real_n), w, num_layers, cap,
-        BLOCK=_BLOCK, HAS_COL=slot_col is not None, num_warps=_NUM_WARPS,
+        BLOCK=_BLOCK, HAS_COL=slot_col is not None,
+        SLOT_PER_LAYER=slot_vid.ndim == 2, num_warps=_NUM_WARPS,
     )
 
 

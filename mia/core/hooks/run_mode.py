@@ -8,7 +8,7 @@ from mia.errors import MiaConfigurationError, MiaRefusal
 GRAPH_ENV = "MIA_ALLOW_CUDAGRAPH"
 WORKER_ENV = "MIA_WORKER"
 
-MIA_WORKER_VALUES = ("hidden_states", "qk", "steer")
+MIA_WORKER_VALUES = ("hidden_states", "hidden_state_accum", "qk", "steer", "steer_capture")
 DEFAULT_MIA_WORKER = "hidden_states"
 
 
@@ -17,7 +17,7 @@ class UnknownMiaWorkerError(MiaRefusal, ValueError):
 
 
 def parse_mia_worker_env(raw):
-    """Parse a raw MIA_WORKER value into 'hidden_states' | 'qk' | 'steer', or None."""
+    """Parse MIA_WORKER into a supported worker kind, or return None if unset."""
     if raw is None or raw == "":
         return None
     if raw in MIA_WORKER_VALUES:

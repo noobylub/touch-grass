@@ -107,8 +107,7 @@ class HSCaptureHost(nn.Module):
 
 
 class SteerHost(nn.Module):
-    """Per-decoder-layer host for buffer-mode activation steering."""
-
+    """Per-decoder-layer host for buffer-mode activation steering. Applies steering here"""
     def __init__(
         self,
         module_name: str,
@@ -131,7 +130,7 @@ class SteerHost(nn.Module):
     def bind_views(self, coeff: torch.Tensor, vec_id: torch.Tensor,
                    mode: torch.Tensor, vec_table: torch.Tensor,
                    avg_proj: torch.Tensor) -> None:
-        """Attach this layer's coeff/vec_id/mode row-views + the shared tables."""
+        """Store references to this layer's steering views and the shared tables; no tensors are copied."""
         self.coeff = coeff
         self.vec_id = vec_id
         self.mode = mode

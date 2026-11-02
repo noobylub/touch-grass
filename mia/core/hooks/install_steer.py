@@ -1,6 +1,7 @@
 """CUDA-graph activation-steering install (buffer mode)."""
 from __future__ import annotations
 
+import math
 import os
 from typing import Any, Dict, Optional
 
@@ -39,6 +40,40 @@ _STEER_HOST_ATTR = "_mia_steer_host"
 _ACTIVE_WORKER_STEER = None
 
 
+def _steer_vector_specs(cfg: dict, num_layers: int):
+    """Normalize legacy single-vector and served multi-vector configs for graph routing."""
+    vectors = cfg.get("vectors")
+    if vectors is None:
+        path = cfg.get("vector_path")
+        layers = _parse_steer_layers(cfg.get("optimal_layer", -1), num_layers)
+        if not path or not layers:
+            return None
+        method = cfg.get("method", "adjust_rs")
+        coefficient = 0.0 if method == "adjust_rs" else float(
+            cfg.get("coefficient", 0.0))
+        return [(path, method, coefficient, layers)]
+
+    if not isinstance(vectors, list) or not vectors:
+        return None
+    specs = []
+    used_layers = set()
+    for vector in vectors:
+        if not isinstance(vector, dict) or not vector.get("vector_path"):
+            return None
+        layer = vector.get("layer", vector.get("optimal_layer"))
+        layers = _parse_steer_layers(layer, num_layers)
+        if len(layers) != 1 or layers[0] in used_layers:
+            return None
+        method = vector.get("method", cfg.get("method", "add_vector"))
+        coefficient = vector.get("coefficient", cfg.get("coefficient", 0.0))
+        if (method != "add_vector" or type(coefficient) not in (int, float)
+                or not math.isfinite(coefficient)):
+            return None
+        used_layers.add(layers[0])
+        specs.append((vector["vector_path"], method, float(coefficient), layers))
+    return specs
+
+
 def _require_buffer_mode_steer() -> None:
     mode = os.environ.get("MIA_STEER_MODE", "buffer").strip().lower()
     if mode not in ("", "buffer"):
@@ -71,7 +106,7 @@ def _wrap_layer_class(cls: type) -> None:
     cls.forward = make_wrapped(orig_forward)
 
 
-def install_steer_hosts(worker) -> None:
+def install_steer_hosts(worker, *, layer_wrapper=None) -> None:
     """Install the buffer-mode steering path via decoder-layer wrap."""
     global _ACTIVE_WORKER_STEER
 
@@ -101,7 +136,7 @@ def install_steer_hosts(worker) -> None:
 
     device_t = next(model.parameters()).device
 
-    _install_steer_buffer(worker, model, matched, device_t)
+    _install_steer_buffer(worker, model, matched, device_t, layer_wrapper=layer_wrapper)
 
 
 class SteerRegistry:
@@ -135,6 +170,7 @@ class SteerRegistry:
         self.vec_paths: Dict[str, int] = {}
         self.vec_has_avgproj: set = set()
         self._next_vec_id = 0
+        self._free_vec_ids: list[int] = []
         self.steer_skipped = 0
         self._skip_warned: set = set()
         self._pending_plans: list = []
@@ -163,13 +199,14 @@ class SteerRegistry:
         self._slot_req_key: Optional[tuple] = None
         if self._gpu_routing_env:
             pin = self.device.type == "cuda"
-            self.slot_vid = torch.zeros(cap, dtype=torch.int64, device=device)
-            self.slot_mode = torch.zeros(cap, dtype=torch.int64, device=device)
-            self.slot_coeff = torch.zeros(cap, dtype=torch.float32, device=device)
+            # A request can use a different vector at each layer, but only one per layer.
+            self.slot_vid = torch.zeros(cap, num_layers, dtype=torch.int64, device=device)
+            self.slot_mode = torch.zeros(cap, num_layers, dtype=torch.int64, device=device)
+            self.slot_coeff = torch.zeros(cap, num_layers, dtype=torch.float32, device=device)
             self.slot_layer_mask = torch.zeros(cap, num_layers, dtype=torch.bool, device=device)
-            self._slot_vid_h = torch.zeros(cap, dtype=torch.int64, pin_memory=pin)
-            self._slot_mode_h = torch.zeros(cap, dtype=torch.int64, pin_memory=pin)
-            self._slot_coeff_h = torch.zeros(cap, dtype=torch.float32, pin_memory=pin)
+            self._slot_vid_h = torch.zeros(cap, num_layers, dtype=torch.int64, pin_memory=pin)
+            self._slot_mode_h = torch.zeros(cap, num_layers, dtype=torch.int64, pin_memory=pin)
+            self._slot_coeff_h = torch.zeros(cap, num_layers, dtype=torch.float32, pin_memory=pin)
             self._slot_mask_h = torch.zeros(cap, num_layers, dtype=torch.bool, pin_memory=pin)
             self._slot_vid_np = self._slot_vid_h.numpy()
             self._slot_mode_np = self._slot_mode_h.numpy()
@@ -381,32 +418,31 @@ class SteerRegistry:
         vid_np, mode_np = self._slot_vid_np, self._slot_mode_np
         coeff_np, mask_np = self._slot_coeff_np, self._slot_mask_np
         for i in changed:
-            vid_np[i] = 0
-            mode_np[i] = 0
-            coeff_np[i] = 0.0
+            vid_np[i, :] = 0
+            mode_np[i, :] = 0
+            coeff_np[i, :] = 0.0
             mask_np[i] = False
             extra = step.extra_args_for(i)
             steer_arg = (extra or {}).get("steer")
             cfg = _resolve_steer_config(steer_arg, env_path)
             if cfg is None:
                 continue
-            layers = _parse_steer_layers(cfg.get("optimal_layer", -1), self.num_layers)
-            method = cfg.get("method", "adjust_rs")
-            vector_path = cfg.get("vector_path")
-            if not layers or method not in ("add_vector", "adjust_rs") or not vector_path:
+            specs = _steer_vector_specs(cfg, self.num_layers)
+            if not specs:
                 continue
-            vid = self.vec_id_for_path(vector_path, worker)
-            if vid is None:
-                continue
-            if method == "adjust_rs" and vid not in self.vec_has_avgproj:
-                self.note_skip(vector_path, "adjust_rs vector has no avg_proj")
-                continue
-            vid_np[i] = vid
-            mode_np[i] = 1 if method == "adjust_rs" else 0
-            coeff_np[i] = 0.0 if method == "adjust_rs" else float(
-                cfg.get("coefficient", 0.0))
-            mask_np[i, np.asarray(layers, dtype=np.intp)] = True
-            PROF.incr("steer.fire")
+            for vector_path, method, coefficient, layers in specs:
+                vid = self.vec_id_for_path(vector_path, worker)
+                if vid is None:
+                    continue
+                if method == "adjust_rs" and vid not in self.vec_has_avgproj:
+                    self.note_skip(vector_path, "adjust_rs vector has no avg_proj")
+                    continue
+                for layer in layers:
+                    vid_np[i, layer] = vid
+                    mode_np[i, layer] = 1 if method == "adjust_rs" else 0
+                    coeff_np[i, layer] = coefficient
+                    mask_np[i, layer] = True
+                PROF.incr("steer.fire")
         self.slot_vid[:bs].copy_(self._slot_vid_h[:bs], non_blocking=True)
         self.slot_mode[:bs].copy_(self._slot_mode_h[:bs], non_blocking=True)
         self.slot_coeff[:bs].copy_(self._slot_coeff_h[:bs], non_blocking=True)
@@ -460,12 +496,15 @@ class SteerRegistry:
                 data["avg_proj"] = float(ap.item()) if torch.is_tensor(ap) else float(ap)
             if cache is not None:
                 cache[path] = data
-        if self._next_vec_id >= self.v_max:
+        if self._free_vec_ids:
+            vid = self._free_vec_ids.pop()
+        elif self._next_vec_id < self.v_max:
+            vid = self._next_vec_id
+            self._next_vec_id += 1
+        else:
             self.note_skip(path, f"steering vector table is full (MIA_STEER_VMAX={self.v_max} "
                                  f"distinct vectors per engine)")
             return None
-        vid = self._next_vec_id
-        self._next_vec_id += 1
         self.vec_table[vid].copy_(
             data["dir"].to(self.vec_table.device, dtype=self.vec_table.dtype).view(-1))
         if "avg_proj" in data:
@@ -474,8 +513,29 @@ class SteerRegistry:
         self.vec_paths[path] = vid
         return vid
 
+    def evict_path(self, path: str, worker) -> bool:
+        """Clear an idle vector's table row so a later request can reuse its slot."""
+        vid = self.vec_paths.pop(path, None)
+        if vid is None:
+            return False
+        self.vec_table[vid].zero_()
+        self.avg_proj_table[vid].zero_()
+        self.vec_has_avgproj.discard(vid)
+        self._free_vec_ids.append(vid)
+        self._skip_warned.discard(path)
+        stale_states = [key for key in self._st_intern if key[2] == vid]
+        for key in stale_states:
+            state_id = self._st_intern.pop(key)
+            self._st_val.pop(state_id, None)
+        if stale_states:
+            self.force_full_routing()
+        cache = getattr(worker, "_vector_cache", None)
+        if cache is not None:
+            cache.pop(path, None)
+        return True
 
-def _install_steer_buffer(worker, model, matched, device) -> SteerRegistry:
+
+def _install_steer_buffer(worker, model, matched, device, *, layer_wrapper=None) -> SteerRegistry:
     cap = _resolve_max_num_batched_tokens(worker)
     cfg = model.config
     text_cfg = getattr(cfg, "text_config", cfg)
@@ -495,7 +555,7 @@ def _install_steer_buffer(worker, model, matched, device) -> SteerRegistry:
             setattr(module, _STEER_HOST_ATTR, host)
             registry.register_host(host)
             n_wired += 1
-        _wrap_layer_class(type(module))
+        (layer_wrapper or _wrap_layer_class)(type(module))
     registry.assign_views()
 
     set_registry(worker, "steer", registry)
@@ -544,23 +604,9 @@ def _build_routing_steer(step: StepView, registry: SteerRegistry) -> list:
         cfg = _resolve_steer_config(steer_arg, env_path)
         if cfg is None:
             continue
-        layers = _parse_steer_layers(cfg.get("optimal_layer", -1), registry.num_layers)
-        if not layers:
+        specs = _steer_vector_specs(cfg, registry.num_layers)
+        if not specs:
             continue
-        method = cfg.get("method", "adjust_rs")
-        if method not in ("add_vector", "adjust_rs"):
-            continue
-        vector_path = cfg.get("vector_path")
-        if not vector_path:
-            continue
-        vid = registry.vec_id_for_path(vector_path, worker)
-        if vid is None:
-            continue
-        if method == "adjust_rs" and vid not in registry.vec_has_avgproj:
-            registry.note_skip(vector_path, "adjust_rs vector has no avg_proj")
-            continue
-        mode_val = 1 if method == "adjust_rs" else 0
-        coefficient = 0.0 if method == "adjust_rs" else float(cfg.get("coefficient", 0.0))
 
         start = int(qsl[i])
         end = min(int(qsl[i + 1]), cap)
@@ -584,14 +630,22 @@ def _build_routing_steer(step: StepView, registry: SteerRegistry) -> list:
             continue
         row_lo, row_hi = span
 
-        for layer in layers:
-            if inc:
-                assignments.append((row_lo, row_hi, layer, coefficient, vid, mode_val))
-            else:
-                coeff_pinned[layer, row_lo:row_hi] = coefficient
-                vecid_pinned[layer, row_lo:row_hi] = vid
-                mode_pinned[layer, row_lo:row_hi] = mode_val
-            plans.append({"req_idx": i, "layer": layer, "method": method, "vid": vid})
+        for vector_path, method, coefficient, layers in specs:
+            vid = registry.vec_id_for_path(vector_path, worker)
+            if vid is None:
+                continue
+            if method == "adjust_rs" and vid not in registry.vec_has_avgproj:
+                registry.note_skip(vector_path, "adjust_rs vector has no avg_proj")
+                continue
+            mode_val = 1 if method == "adjust_rs" else 0
+            for layer in layers:
+                if inc:
+                    assignments.append((row_lo, row_hi, layer, coefficient, vid, mode_val))
+                else:
+                    coeff_pinned[layer, row_lo:row_hi] = coefficient
+                    vecid_pinned[layer, row_lo:row_hi] = vid
+                    mode_pinned[layer, row_lo:row_hi] = mode_val
+                plans.append({"req_idx": i, "layer": layer, "method": method, "vid": vid})
 
     if inc:
         registry._pending_assignments = assignments

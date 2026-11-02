@@ -438,8 +438,7 @@ class MiaClient:
 
         self.layer_to_heads: Dict[int, list] = {}
         self._output_layers = None
-        # A steering config asks for no capture.
-        self._captures = "steering" not in cfg
+        self._captures = "steering" not in cfg or "hidden_states" in cfg
 
         if "params" in cfg and "important_heads" in cfg["params"]:
             for layer_idx, head_idx in cfg["params"]["important_heads"]:
