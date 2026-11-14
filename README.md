@@ -6,7 +6,7 @@ Yun-Ko and her team in IBM have done a phenomenal job in creating the tool that 
 
 The workers, as defined in [mia/workers](mia/workers/) would be responsible for setting up and installing the hook itself. The hook logic itself is then defined in the [mia/core/hooks](mia/core/hooks/), where the wrapper calls the original forward call method, and performs the custom operation.
 
-Current IBM vLLM Hook inherits all configurations for custom operation through a config file. I find this capability to be lacking for my use-case, as I would like the end user, in the website, to define the parameters, for example the layers to extract or steer, in the http request not in the hardcoded config file.
+The original version of IBM vLLM Hook inherits all configurations for custom operation through a config file. I find this capability to be lacking for my use-case, as I would like the end user, in the website, to define the parameters, for example the layers to extract or steer, in the http request not in the hardcoded config file.
 
 Therefore I modified the vllm_xargs so that the  worker reads those parameters and prepares the state or routing needed by the operation, allowing different requests to use different settings. In addition, I have also added a new worker.
 
