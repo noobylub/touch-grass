@@ -8,7 +8,7 @@ The workers, as defined in [mia/workers](mia/workers/) would be responsible for 
 
 The original version of IBM vLLM Hook inherits all configurations for custom operation through a config file. I find this capability to be lacking for my use-case, as I would like the end user, in the website, to define the parameters, for example the layers to extract or steer, in the http request not in the hardcoded config file.
 
-Therefore I modified the vllm_xargs so that the  worker reads those parameters and prepares the state or routing needed by the operation, allowing different requests to use different settings. In addition, I have also added a new worker.
+Therefore I modified the vllm_xargs so that the  worker reads those parameters and prepares the state or routing needed by the operation, allowing different requests to use different parameters such as layers to steer. In addition, I have also added a new worker.
 
 The original IBM vLLM Hook provided workers for tasks such as activation steering and hidden-state capture, but its configuration-driven workflow did not fit my goal of extracting steering vectors from positive and negative examples. I added a hidden_state_accum worker ([hidden_state_accum_worker.py](mia/workers/hidden_state_accum_worker.py)) with a custom GPU accumulation operation ([hidden_state_accum_op.py](mia/core/hooks/hidden_state_accum_op.py)).
 
